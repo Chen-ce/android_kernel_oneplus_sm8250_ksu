@@ -1,6 +1,7 @@
 #include "selinux.h"
 #include "linux/cred.h"
 #include "linux/sched.h"
+#include "linux/security.h"
 #include "objsec.h"
 #include "linux/version.h"
 #include "../klog.h" // IWYU pragma: keep
@@ -25,18 +26,16 @@ u32 ksu_file_sid __read_mostly = 0;
 
 static int transive_to_domain(const char *domain, struct cred *cred)
 {
+    struct task_security_struct *tsec;
     u32 sid;
     int error;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
-    struct task_security_struct *tsec;
-#else
-    struct cred_security_struct *tsec;
-#endif
+
     tsec = selinux_cred(cred);
     if (!tsec) {
         pr_err("tsec == NULL!\n");
         return -1;
     }
+
     error = security_secctx_to_secid(domain, strlen(domain), &sid);
     if (error) {
         pr_info("security_secctx_to_secid %s -> sid: %d, error: %d\n", domain,
@@ -69,22 +68,36 @@ void setup_ksu_cred(void)
 void setenforce(bool enforce)
 {
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
-    selinux_state.enforcing = enforce;
+#ifdef KSU_COMPAT_USE_SELINUX_STATE
+	selinux_state.enforcing = enforce;
+#else
+	selinux_enforcing = enforce;
+#endif
 #endif
 }
 
 bool getenforce(void)
 {
 #ifdef CONFIG_SECURITY_SELINUX_DISABLE
-    if (selinux_state.disabled) {
-        return false;
-    }
-#endif
+#ifdef KSU_COMPAT_USE_SELINUX_STATE
+	if (selinux_state.disabled) {
+		return false;
+	}
+#else
+	if (selinux_disabled) {
+		return false;
+	}
+#endif // KSU_COMPAT_USE_SELINUX_STATE
+#endif // CONFIG_SECURITY_SELINUX_DISABLE
 
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
-    return selinux_state.enforcing;
+#ifdef KSU_COMPAT_USE_SELINUX_STATE
+	return selinux_state.enforcing;
 #else
-    return true;
+	return selinux_enforcing;
+#endif
+#else
+	return true;
 #endif
 }
 
@@ -112,6 +125,7 @@ static void __security_release_secctx(struct lsm_context *cp)
  * Called once after SELinux policy is loaded (post-fs-data).
  * This eliminates expensive string comparisons in hot paths.
  */
+
 void cache_sid(void)
 {
     int err;
@@ -163,28 +177,32 @@ static bool is_sid_match(const struct cred *cred, u32 cached_sid,
     if (!cred) {
         return false;
     }
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
-    const struct task_security_struct *tsec = selinux_cred(cred);
-#else
-    const struct cred_security_struct *tsec = selinux_cred(cred);
-#endif
+
+    // Cast pointer dynamically to avoid struct cred_security_struct 
+    // vs task_security_struct mismatch
+    struct task_security_struct *tsec = selinux_cred(cred);
     if (!tsec) {
         return false;
     }
-
-    // Fast path: use cached SID if available
+    
+    // use cached SID if available
     if (likely(cached_sid != 0)) {
         return tsec->sid == cached_sid;
     }
 
-    // Slow path fallback: string comparison (only before cache is initialized)
+    // fallback: string comparison (only before cache is initialized)
     struct lsm_context ctx;
     bool result;
     if (__security_secid_to_secctx(tsec->sid, &ctx)) {
         return false;
     }
-    result = strncmp(fallback_context, ctx.context, ctx.len) == 0;
+    
+    // Contexts from security_secid_to_secctx are null terminated. 
+    // Using strncmp with ctx.len is dangerous because ctx.len 
+    // might include the null byte.
+    result = strcmp(fallback_context, ctx.context) == 0;
     __security_release_secctx(&ctx);
+
     return result;
 }
 
